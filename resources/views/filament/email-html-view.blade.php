@@ -1,7 +1,14 @@
 {{-- Mailpit-style tabbed message viewer.
 Rendered inside the infolist — must NOT wrap in <x-filament-panels::page>,
     that duplicates the page header/breadcrumbs --}}
-    <div x-data="{ tab: 'html' }" class="email-viewer">
+    <div x-data="{
+            tab: 'html',
+            onPreviewMessage(e) {
+                if (!e.data || e.data.nativemailerPreview !== true || !e.data.url) return;
+                if (this.$refs.preview && e.source !== this.$refs.preview.contentWindow) return;
+                $wire.openExternalLink(e.data.url);
+            },
+        }" x-on:message.window="onPreviewMessage($event)" class="email-viewer">
 
         @php
             use App\Support\MimeHeader;
@@ -22,6 +29,42 @@ Rendered inside the infolist — must NOT wrap in <x-filament-panels::page>,
             }
 
             $attachments = $email->attachments ?? [];
+
+            // The iframe is sandboxed with no allow-top-navigation and no allow-same-origin,
+            // so a bare click on <a href> inside it is silently swallowed by the browser —
+            // that's the bug. We allow-scripts just enough to run this small interceptor,
+            // which stops the click, and hands the URL to the parent via postMessage so it
+            // can be opened with the OS's default browser instead of navigating in-app.
+            $linkInterceptorScript = <<<'HTML'
+                <script>
+                (function () {
+                    function externalUrl(el) {
+                        var href = el && el.getAttribute('href');
+                        return href && /^(https?:|mailto:|tel:)/i.test(href) ? href : null;
+                    }
+
+                    document.addEventListener('click', function (e) {
+                        var el = e.target;
+                        while (el && el !== document && el.tagName !== 'A') {
+                            el = el.parentElement;
+                        }
+                        var url = el ? externalUrl(el) : null;
+                        if (!url) return;
+                        e.preventDefault();
+                        e.stopPropagation();
+                        parent.postMessage({ nativemailerPreview: true, url: url }, '*');
+                    }, true);
+
+                    // Defensive: templates that navigate via window.open() instead of a plain click.
+                    window.open = function (url) {
+                        if (url) parent.postMessage({ nativemailerPreview: true, url: url }, '*');
+                        return null;
+                    };
+                })();
+                </script>
+                HTML;
+
+            $previewHtml = $linkInterceptorScript . ($email->body_html ?? '');
         @endphp
 
         {{-- Tab bar --}}
@@ -47,8 +90,12 @@ Rendered inside the infolist — must NOT wrap in <x-filament-panels::page>,
         <div x-show="tab === 'html'" role="tabpanel">
             @if (filled($email->body_html))
                 <div class="ev-panel ev-white">
-                    {{-- Fully sandboxed: no scripts, no same-origin access — email HTML is untrusted --}}
-                    <iframe srcdoc="{{ $email->body_html }}" class="ev-iframe" sandbox="" title="Email Preview"></iframe>
+                    {{-- Sandboxed with allow-scripts only (no allow-same-origin, no allow-top-navigation,
+                        no allow-popups): the email HTML is untrusted and can't touch the app's cookies/DOM
+                        or navigate/pop out on its own — it can only ask the parent (via the interceptor
+                        script above) to hand a link off to the OS browser. --}}
+                    <iframe srcdoc="{{ $previewHtml }}" class="ev-iframe" sandbox="allow-scripts"
+                        x-ref="preview" title="Email Preview"></iframe>
                 </div>
             @elseif (filled($email->body_text))
                 <div class="ev-panel ev-white">
